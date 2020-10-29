@@ -1,19 +1,139 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+#Plato Trial Pipeline
 
-trigger:
-- master
+variables:
+  - name: NOKIA_USERNAME
+    value: $(USERNAME)
+    readonly: true
+  - name: NOKIA_PASSWORD
+    value: $(PASSWORD)
+    readonly: true
+  - name: PLATO_PROJECT_NAME
+    value: "devops"
+    readonly: true
+  - name: PLATO_FILE_LOCATION
+    value: "/tmp/file.xlsx"    
+    readonly: true
+  - name: PLATO_PRODUCT_UUID
+    value: "843dc5b8-f8a8-477e-8f88-97268d0f9b8b"
+  - name: PLATO_FILE_UPLOAD
+    value: $(FILE_UPLOAD)
+  - name: PLATO_CUSTOMER_NAME
+    value: "NSW"
+  - name: PLATO_SERVER_URL
+    value: "http://plato.dynamic.nsn-net.net"
+  - name: XML_FILE_LOCATION
+    value: "/tmp/nef.xml"
+  - name: PLATO_DOCKER_IMAGE
+    value: "nswatg-local.artifactory-espoo2.int.net.nokia.com/plato-cli:latest"
 
-pool:
-  vmImage: 'ubuntu-latest'
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+trigger: none
+
+stages:
+
+- stage: DownloadCIQFromPlato
+  displayName: Download CIQ from Plato
+  pool:
+    name: achill-centos7
+  jobs:
+  - job: CleanUp
+    displayName: CleanUp
+    steps:
+    - task: Bash@3
+      inputs:
+        targetType: inline
+        script: >
+          echo "Deleting Files ..."
+          echo "Token File Location: ${PLATO_TOKEN_LOCATION}"
+          echo "File Download Location: ${PLATO_FILE_LOCATION}"
+          rm -Rf ${PLATO_FILE_LOCATION}
+          rm -Rf ${PLATO_TOKEN_LOCATION}
+          
+  - job: Upload
+    displayName: Upload to Plato
+    dependsOn: CleanUp
+    condition: succeeded('CleanUp')
+    steps:
+      - script: |
+          echo "Proxy: $http_proxy"
+          echo "Username: $NOKIA_USERNAME"
+          #echo "Pass : " 
+          #echo $(NOKIA_PASSWORD) | cut -c2-3
+          echo ${NOKIA_PASSWORD} | cut -c2-3
+
+          docker run --rm  -e http_proxy=$http_proxy -e https_proxy=$https_proxy -v /tmp:/tmp nswatg-local.artifactory-espoo2.int.net.nokia.com/plato-cli:latest \
+            login --password $(NOKIA_PASSWORD) --username $NOKIA_USERNAME  
+        displayName: 'Login to Plato'
+      - script: |    
+          echo "Plato Project Name: ${PLATO_PROJECT_NAME}"
+          echo "Plato Customer Name: ${PLATO_CUSTOMER_NAME}"
+          echo "File to Upload: ${PLATO_FILE_UPLOAD}"     
+          docker run --rm  -e http_proxy=$http_proxy -e https_proxy=$https_proxy -v /tmp:/tmp nswatg-local.artifactory-espoo2.int.net.nokia.com/plato-cli:latest \
+            createProject \
+            --project_name $PLATO_PROJECT_NAME \
+            --customer $PLATO_CUSTOMER_NAME \
+            --file $PLATO_FILE_UPLOAD                
+        displayName: 'Upload Excel to Plato'
+
+  - job: Download
+    displayName: Download from Plato
+    dependsOn: Upload
+    condition: succeeded('Upload')
+    steps: 
+      - script: |
+          echo "Proxy: $http_proxy"
+          echo "Username: $NOKIA_USERNAME"
+          docker run --rm  -e http_proxy=$http_proxy -e https_proxy=$https_proxy -v /tmp:/data nswatg-local.artifactory-espoo2.int.net.nokia.com/plato-cli:latest \
+            login --password $(NOKIA_PASSWORD) --username $NOKIA_USERNAME  
+        displayName: 'Login to Plato'
+      - script: |          
+          echo "wait for Plato"          
+          sleep 30
+                
+        displayName: 'Wait for Plato (Workaround)'
+      - script: |          
+          echo "Plato Project Name: ${PLATO_PROJECT_NAME}"          
+          echo "XML File Location : ${XML_FILE_LOCATION}"     
+          docker run --rm  -e http_proxy=$http_proxy -e https_proxy=$https_proxy -v /tmp:/tmp nswatg-local.artifactory-espoo2.int.net.nokia.com/plato-cli:latest \
+            downloadConfiguration \
+            --project_name $PLATO_PROJECT_NAME \
+            --target_file $XML_FILE_LOCATION
+                
+        displayName: 'Download XML from Plato'
+- stage: CreateDeployNetworkService
+  displayName: Create and Deploy Network Service using CBND
+  pool:
+    name: achill-centos7
+  jobs:
+  - job: CleanUp
+    displayName: CleanUp
+    steps:
+    - task: Bash@3
+      inputs:
+        targetType: inline
+        script: >
+          
+          
+  - job: CreatePackage
+    displayName: Create NS Package on CBND
+    dependsOn: CleanUp
+    condition: succeeded('CleanUp')
+    steps:
+      - script: |          
+            docker run --rm  -e http_proxy="" -e https_proxy="" -v /tmp:/tmp nswatg-local.artifactory-espoo2.int.net.nokia.com/cbnd-cli:latest \
+            createNSPackage --package_name nef-package --package_version 21.03 > /tmp/package_id.txt
+            export CBND_PACKAGE_ID=`cat /tmp/package_id.txt`
+            echo "Package ID : ${CBND_PACKAGE_ID}"
+            echo "##vso[task.setvariable variable=package_id]${CBND_PACKAGE_ID}"          
+        displayName: 'Create NS Package'
+      - script: |          
+          export CBND_NS_ID=`docker run --rm  -e http_proxy="" -e https_proxy="" -v /tmp:/tmp nswatg-local.artifactory-espoo2.int.net.nokia.com/cbnd-cli:latest \
+            create createNS --ns_name test --package_id $(package_id)`
+            echo "##vso[task.setvariable variable=ns_id]$CBND_NS_ID"
+        displayName: 'Deploy NS Service'
+      - script: |          
+          docker run --rm  -e http_proxy="" -e https_proxy="" -v /tmp:/tmp nswatg-local.artifactory-espoo2.int.net.nokia.com/cbnd-cli:latest \
+            create deployNS --ns_id $(ns_id) --tenant "NSW"
+        displayName: 'Deploy NS Service'
+      
